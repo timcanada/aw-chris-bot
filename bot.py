@@ -1,127 +1,154 @@
-import os,json,logging,threading,schedule,time,smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os,json,logging,threading,schedule,time
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=r'C:\Users\tim.peters\competitor-monitor\.env')
 from datetime import datetime
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import anthropic
+
 logging.basicConfig(level=logging.INFO)
 log=logging.getLogger(__name__)
 D=r'C:\Users\tim.peters\competitor-monitor'
 app=App(token=os.environ["SLACK_BOT_TOKEN"])
 ai=anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-def fetch(c, hours=720):
-    days = hours // 24
-    r=ai.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        tools=[{"type":"web_search_20250305","name":"web_search"}],
-        messages=[{"role":"user","content":
-            f"You are a competitive intelligence analyst for Guideline, a media planning & buying platform. "
-            f"Search for news from the PAST {days} DAYS ONLY about: {', '.join(c)}. "
-            f"Only include stories published in the last {days} days - ignore anything older. "
-            f"For each company: top 2-3 recent developments and why it matters for Guideline. "
-            f"Use *bold* and bullets. Max 150 words each. Today: {datetime.now().strftime('%B %d, %Y')}."
-        }]
-    )
-    return "\n\n".join(b.text for b in r.content if hasattr(b,"text"))
+# Conversation history per user (in-memory)
+conversations={}
 
 def load_cfg():
-    with open(D+"\\config.json") as f: return json.load(f)
+    path=D+"\\config.json"
+    if not os.path.exists(path):
+        cfg={"competitors":["Mediaocean","Operative","FreeWheel","Bionic Advertising Systems","Centro/Basis Technologies"]}
+        save_cfg(cfg); return cfg
+    with open(path) as f: return json.load(f)
+
 def save_cfg(cfg):
     with open(D+"\\config.json","w") as f: json.dump(cfg,f,indent=2)
 
-def send_email(subject, body):
-    try:
-        smtp_user = os.environ.get("SMTP_USER","")
-        smtp_pass = os.environ.get("SMTP_PASS","")
-        if not smtp_user or not smtp_pass:
-            log.warning("No SMTP credentials - skipping email")
-            return
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = smtp_user
-        msg["To"] = "tim.peters@guideline.ai"
-        msg.attach(MIMEText(body, "plain"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(smtp_user, smtp_pass)
-            s.sendmail(smtp_user, "tim.peters@guideline.ai", msg.as_string())
-        log.info("Email sent to tim.peters@guideline.ai")
-    except Exception as e:
-        log.error(f"Email failed: {e}")
+SYSTEM="""You are AW-Chris, a sharp competitive intelligence analyst for Guideline — a media planning and buying platform. You live in Slack.
+
+Your personality: direct, smart, like a brilliant colleague who knows the ad-tech space deeply. No fluff. Conversational.
+
+What you can do:
+- Chat naturally about anything — strategy, competitors, market trends, prep for meetings
+- Search the web for latest news (default: past 24 hours unless asked otherwise)
+- Manage Tim's competitor watchlist — add or remove by understanding natural language like "keep an eye on MediaRadar" or "drop Operative from the list"
+- Send daily 5am briefings automatically
+
+Rules:
+- ALWAYS use web search for any question about current news, company updates, or market info
+- Remember conversation context — if Tim asks a follow-up, use prior messages
+- When Tim asks to add/remove a competitor, do it and confirm naturally
+- Be like a smart colleague texting back, not a formal report
+- Keep responses tight — use bullets only when listing multiple things, otherwise just talk
+
+Current context is injected each message."""
+
+def chat(user_id, user_msg, cfg):
+    competitors=cfg.get("competitors",[])
+    if user_id not in conversations:
+        conversations[user_id]=[]
+
+    system=SYSTEM+f"\n\nTim's competitor watchlist: {', '.join(competitors) if competitors else 'empty — ask Tim what to track'}"
+    system+=f"\nCurrent time: {datetime.now().strftime('%A %B %d, %Y %I:%M %p')}"
+
+    conversations[user_id].append({"role":"user","content":user_msg})
+    history=conversations[user_id][-20:]
+
+    resp=ai.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        system=system,
+        tools=[{"type":"web_search_20250305","name":"web_search"}],
+        messages=history
+    )
+    reply="\n\n".join(b.text for b in resp.content if hasattr(b,"text"))
+    conversations[user_id].append({"role":"assistant","content":reply})
+
+    # Detect competitor list changes from the message
+    msg_l=user_msg.lower()
+    add_phrases=["add ","track ","start tracking","keep an eye on","watch ","monitor "]
+    remove_phrases=["remove ","stop tracking","drop ","untrack ","forget "]
+
+    for phrase in add_phrases:
+        if phrase in msg_l and any(w in msg_l for w in ["competitor","company","them","list","watchlist",phrase.strip()]):
+            raw=user_msg.lower().split(phrase)[-1].strip()
+            name=raw.split(" to ")[0].split(" from")[0].split(" on")[0].strip().title()
+            if name and len(name)>2 and name.lower() not in ["competitor","company","list","the list","my list"]:
+                if name not in competitors:
+                    competitors.append(name); cfg["competitors"]=competitors; save_cfg(cfg)
+                    log.info(f"Added: {name}")
+            break
+
+    for phrase in remove_phrases:
+        if phrase in msg_l:
+            raw=user_msg.lower().split(phrase)[-1].strip()
+            name=raw.split(" from")[0].split(" off")[0].strip().title()
+            orig_len=len(competitors)
+            cfg["competitors"]=[c for c in competitors if c.lower()!=name.lower()]
+            if len(cfg["competitors"])<orig_len:
+                save_cfg(cfg); log.info(f"Removed: {name}")
+            break
+
+    return reply
 
 def post_daily_digest():
-    cfg=load_cfg()
-    c=cfg.get("competitors",[])
-    if not c: return
-    log.info("Running 5am daily digest...")
-    intel = fetch(c, hours=24)
-    header = f"*🕵️ Daily Competitor Intel — {datetime.now().strftime('%B %d, %Y')}*\n_Past 24 hours | Tracking: {', '.join(c)}_\n{'─'*40}\n\n"
-    footer = f"\n{'─'*40}\n_Powered by AW-Chris · Daily 5am digest_"
-    full = header + intel + footer
-    # Post to Slack
+    cfg=load_cfg(); competitors=cfg.get("competitors",[])
+    if not competitors: return
+    log.info("Posting 5am digest...")
+    resp=ai.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2000,
+        system=SYSTEM+f"\n\nCompetitor watchlist: {', '.join(competitors)}\nTime: {datetime.now().strftime('%A %B %d, %Y')}",
+        tools=[{"type":"web_search_20250305","name":"web_search"}],
+        messages=[{"role":"user","content":
+            f"Give Tim his morning competitor briefing. Search for news from the past 24 hours on each of these: {', '.join(competitors)}. "
+            f"For each one that has actual news: what happened and why it matters for Guideline. "
+            f"If nothing happened for a company, just skip them or say it was quiet. "
+            f"Be direct and useful — Tim reads this over coffee."
+        }]
+    )
+    intel="\n\n".join(b.text for b in resp.content if hasattr(b,"text"))
+    msg=f"*Good morning Tim! Competitor Briefing — {datetime.now().strftime('%B %d, %Y')}*\n_Past 24 hours_\n\n{intel}\n\n_— AW-Chris_"
     try:
-        app.client.chat_postMessage(channel="D0ALSF98T3K", text=full, mrkdwn=True)
-        log.info("Daily digest posted to Slack")
-    except Exception as e:
-        log.error(f"Slack post failed: {e}")
-    # Send email
-    send_email(f"Daily Competitor Intel — {datetime.now().strftime('%B %d, %Y')}", full.replace("*","").replace("_",""))
+        app.client.chat_postMessage(channel="D0ALSF98T3K",text=msg,mrkdwn=True)
+        log.info("5am digest sent!")
+    except Exception as e: log.error(f"Digest error: {e}")
 
 def run_scheduler():
     schedule.every().day.at("05:00").do(post_daily_digest)
-    log.info("Scheduler: daily digest at 5:00am")
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-
-HELP = ("Hi! I'm *AW-Chris*, your competitor intel bot (past 30 days only).\n\n"
-        "`get intel` — all competitors, past 30 days\n"
-        "`get intel on <company>` — one company, past 30 days\n"
-        "`list competitors` — show watchlist\n"
-        "`add competitor <n>` — add company\n"
-        "`remove competitor <n>` — remove company\n"
-        "`next digest` — when is next daily digest\n\n"
-        "_Daily digest sent at 5am to Slack + tim.peters@guideline.ai_")
-
-def respond(text, say, dm=False):
-    t=text.lower().strip(); cfg=load_cfg(); c=cfg.get("competitors",[])
-    if "list competitor" in t:
-        say("Tracking:\n"+ "\n".join(f"• {x}" for x in c) if c else "None yet."); return
-    if t.startswith("add competitor "):
-        n=text[15:].strip()
-        if n and n not in c: c.append(n); cfg["competitors"]=c; save_cfg(cfg); say(f"✅ Added *{n}*")
-        return
-    if t.startswith("remove competitor "):
-        n=text[18:].strip(); cfg["competitors"]=[x for x in c if x.lower()!=n.lower()]; save_cfg(cfg); say(f"🗑️ Removed *{n}*"); return
-    if "next digest" in t:
-        say("📅 Next digest: *daily at 5:00am* → Slack + tim.peters@guideline.ai"); return
-    if "get intel on " in t:
-        target=text[t.index("get intel on ")+13:].strip()
-        say(f"🔍 Researching *{target}* (past 30 days)...")
-        say(fetch([target], hours=720)); return
-    if "get intel" in t or "intel" in t or "news" in t or "competitor" in t:
-        if not c: say("No competitors yet."); return
-        say(f"🔍 Fetching past 30 days of intel on: {', '.join(c)}...")
-        say(header := f"*Intel Report — {datetime.now().strftime('%B %d, %Y')}*\n_Past 30 days_\n\n")
-        say(fetch(c, hours=720)); return
-    if dm: say(HELP)
+    log.info("Scheduler: 5am daily digest active")
+    while True: schedule.run_pending(); time.sleep(30)
 
 @app.event("message")
-def handle_dm(event, say):
+def handle_dm(event,say):
     if event.get("channel_type")=="im" and not event.get("bot_id"):
-        respond(event.get("text",""), say, dm=True)
+        text=event.get("text","").strip()
+        if not text: return
+        user_id=event.get("user","default")
+        log.info(f"DM: {text[:60]}")
+        try:
+            cfg=load_cfg()
+            reply=chat(user_id,text,cfg)
+            say(reply)
+        except Exception as e:
+            log.error(f"Error: {e}")
+            say(f"Hit an error — {str(e)[:120]}")
 
 @app.event("app_mention")
-def handle_mention(event, say):
+def handle_mention(event,say):
     text=event.get("text","")
     if "<@" in text: text=text.split(">",1)[-1].strip()
-    respond(text, say)
+    if not text: return
+    user_id=event.get("user","default")
+    try:
+        cfg=load_cfg()
+        reply=chat(user_id,text,cfg)
+        say(reply)
+    except Exception as e:
+        say(f"Error: {str(e)[:120]}")
 
 if __name__=="__main__":
-    threading.Thread(target=run_scheduler, daemon=True).start()
-    log.info("AW-Chris starting! Daily digest at 5am.")
-    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+    threading.Thread(target=run_scheduler,daemon=True).start()
+    log.info("AW-Chris (Opus) starting — conversational mode, 5am digest active")
+    SocketModeHandler(app,os.environ["SLACK_APP_TOKEN"]).start()
